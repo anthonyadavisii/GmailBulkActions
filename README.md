@@ -18,6 +18,6 @@ client secrets)
 
 6. The script writes token.json automatically
 
-Reauthentication may be required on subsequent runs in oath token expired.
+Reauthentication may be required on subsequent runs if oath token expired.
 
 Important nuance that I learned so you don't have to is that some compound queries must be enclosed in parentheses which is done in the script automatically. Example of query that I used: "unsubscribe label:unread larger:1K 
