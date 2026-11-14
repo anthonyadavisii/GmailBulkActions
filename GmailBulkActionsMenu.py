@@ -1,12 +1,99 @@
 from __future__ import print_function
-import os
+import os, time
+from collections import defaultdict
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+import re
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 # If you want permanent delete instead of Trash:
 # SCOPES = ["https://mail.google.com/"]
+
+def get_header(headers, name):
+    for h in headers:
+        if h["name"].lower() == name.lower():
+            return h["value"]
+    return ""
+
+def normalize_sender(sender):
+    """
+    Converts:
+      'John Smith <john@example.com>'
+    into:
+      'john@example.com'
+    """
+    match = re.search(r'<([^>]+)>', sender)
+    if match:
+        return match.group(1).lower()
+
+    return sender.lower().strip()
+
+def analyze_sender_sizes(service, query="", top_n=25):
+    """
+    Analyze mailbox usage by sender.
+
+    query examples:
+      ""
+      "label:inbox"
+      "older_than:2y"
+      "has:attachment"
+    """
+
+    ids = collect_ids(service, query)
+
+    sender_sizes = defaultdict(int)
+    sender_counts = defaultdict(int)
+
+    print(f"Analyzing {len(ids)} messages...")
+
+    for index, msg_id in enumerate(ids, start=1):
+        time.sleep(0.5) #throttle to avoid rate limits
+        try:
+            msg = get_message_with_retry(service, msg_id)
+
+            if msg is None:
+                continue
+
+            size = msg.get("sizeEstimate", 0)
+
+            payload = msg.get("payload", {})
+            headers = payload.get("headers", [])
+
+            sender = get_header(headers, "From")
+            sender = normalize_sender(sender)
+
+            sender_sizes[sender] += size
+            sender_counts[sender] += 1
+
+            if index % 500 == 0:
+                print(f"Processed {index} messages...")
+
+        except Exception as e:
+            print(f"Failed on message {msg_id}: {e}")
+
+    ranking = sorted(
+        sender_sizes.items(),
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    print("\n=== Top Senders by Storage Usage ===")
+    print(
+        f"{'Sender':50} {'Messages':>10} {'MB':>12}"
+    )
+
+    for sender, total_bytes in ranking[:top_n]:
+        mb = total_bytes / (1024 * 1024)
+
+        print(
+            f"{sender[:50]:50} "
+            f"{sender_counts[sender]:10d} "
+            f"{mb:12.2f}"
+        )
+
+    return ranking
 
 def get_service():
     creds = None
@@ -65,71 +152,33 @@ def get_email_details(service, msg_id, full=False):
     ).execute()
     return msg
 
-def main():
-    service = get_service()
-    last_ids = []
-    
-    while True:
-        print("\n=== Gmail Bulk Actions Menu ===")
-        print("1. Enter a Gmail search query")
-        print("2. Display first item from last query")
-        print("3. Display last item from last query")
-        print("4. Delete messages from last query")
-        print("5. Add label to messages from last query")
-        print("6. Exit")
+def get_message_with_retry(service, msg_id, retries=5):
 
-        choice = input("Select an option: ").strip()
+    delay = 1
 
-        # Option 1: Run a new query
-        if choice == "1":
-            prompt = input("Enter your Gmail search query: ")
-            query = "(" + prompt + ")"   # Your working parentheses trick
-            ids = collect_ids(service, query)
-            print(f"Found {len(ids)} messages matching query: {query}")
-            last_ids = ids  # Save results for other menu options
+    for attempt in range(retries):
 
-        # Option 2: First item
-        elif choice == "2":
-            try:
-                print("First item:", last_ids[0])
-            except:
-                print("No results available. Run a query first.")
+        try:
+            return service.users().messages().get(
+                userId="me",
+                id=msg_id,
+                format="metadata",
+                metadataHeaders=["From"]
+            ).execute()
 
-        # Option 3: Last item
-        elif choice == "3":
-            try:
-                print("Last item:", last_ids[-1])
-            except:
-                print("No results available. Run a query first.")
+        except HttpError as e:
 
-        # Option 4: Delete
-        elif choice == "4":
-            try:
-                confirm = input(f"Delete {len(last_ids)} messages? (y/n): ").lower()
-                if confirm == "y":
-                    delete_ids(service, last_ids, permanent=False)
-                    print("Messages moved to Trash.")
-                else:
-                    print("Delete canceled.")
-            except:
-                print("No results available. Run a query first.")
+            if e.resp.status == 403 and "rateLimitExceeded" in str(e):
+                print(
+                    f"Rate limited. Sleeping {delay}s..."
+                )
 
-        # Option 5: Add label
-        elif choice == "5":
-            try:
-                label = input("Enter Gmail label ID to add: ").strip()
-                body = {
-                    "ids": last_ids,
-                    "addLabelIds": [label],
-                    "removeLabelIds": []
-                }
-                service.users().messages().batchModify(
-                    userId="me",
-                    body=body
-                ).execute()
-                print(f"Added label '{label}' to {len(last_ids)} messages.")
-            except:
-                print("No results available. Run a query first.")
+                time.sleep(delay)
+                delay *= 2
+            else:
+                raise
+
+    return None
 
 def main():
     service = get_service()
@@ -143,7 +192,8 @@ def main():
         print("4. Delete messages from last query")
         print("5. Add label to messages from last query")
         print("6. View email details by index")
-        print("7. Exit")
+        print("7. Analyze mailbox size by sender")
+        print("8. Exit")
 
         choice = input("Select an option: ").strip()
 
@@ -228,9 +278,16 @@ def main():
             except Exception as e:
                 print("Error:", e)
                 print("No results available or invalid index.")
-
-        # Option 7: Exit
+        # Option 7: Analyze mailbox size by sender: 
         elif choice == "7":
+
+            query = input(
+                "Optional Gmail query filter (blank for all mail): "
+            ).strip()
+
+            analyze_sender_sizes(service, query)
+        # Option 8: Exit
+        elif choice == "8":
             print("Exiting Gmail Bulk Actions.")
             break
 
